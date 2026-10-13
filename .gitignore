@@ -1,0 +1,17 @@
+.venv/
+.uv-cache/
+.ruff_cache/
+.pytest_cache/
+__pycache__/
+*.py[cod]
+results/
+.cache/
+*.egg-info/
+dist/
+build/
+.test-tmp/
+.mpl-cache/
+artifacts/
+data/
+measurements/
+*.local.json

@@ -1,0 +1,63 @@
+{
+  "name": "Ar CCP / 400 kHz",
+  "geometry": {
+    "cathode_radius_m": 0.15,
+    "chamber_radius_m": 0.2891164991562635,
+    "gap_m": 0.05,
+    "radial_cells": 8,
+    "axial_cells": 12
+  },
+  "plasma": {
+    "pressure_pa": 1.3332236842105263,
+    "gas_temperature_k": 300.0,
+    "density_m3": 3e+16,
+    "density_profile": "uniform",
+    "density_expression": "ne0 * (1 + 0.2*cos(pi*r/R))",
+    "density_csv": "",
+    "density_mode": "self_consistent",
+    "density_relaxation_periods": 10.0,
+    "initial_mean_energy_ev": 4.5,
+    "source_mean_energy_ev": 4.5,
+    "cathode_secondary_yield": 0.0,
+    "ground_secondary_yield": 0.0,
+    "secondary_energy_ev": 2.0,
+    "electron_sticking": 1.0,
+    "ion_energy_frame": "center_of_mass",
+    "electron_flux_limit": true
+  },
+  "numerics": {
+    "frequency_hz": 400000.0,
+    "demo_negative_peak_v": 10000.0,
+    "waveform_csv": "examples/wafer_demo.csv",
+    "waveform_time_column": "time_us",
+    "waveform_voltage_column": "voltage_kV",
+    "waveform_time_scale": 1e-06,
+    "waveform_voltage_scale": 1000,
+    "minimum_cycles": 2,
+    "maximum_cycles": 4,
+    "steps_per_period": 64,
+    "stored_phases": 16,
+    "cfl": 0.4,
+    "periodic_tolerance": 0.02,
+    "newton_tolerance": 2e-06,
+    "newton_iterations": 30,
+    "seed": 20261013,
+    "particles": 2000,
+    "particle_max_periods": 20,
+    "radial_bins": 12,
+    "energy_bins": 160,
+    "angle_bins": 90
+  },
+  "transport": {
+    "en_min_td": 0.001,
+    "en_max_td": 3000.0,
+    "en_points": 12,
+    "energy_max_ev": 400.0,
+    "energy_step_min_ev": 0.01,
+    "angle_cells": 16,
+    "tail_tolerance": 1e-05
+  },
+  "electron_xsec": "xsec/Argon_電子衝突断面積.txt",
+  "ion_xsec": "xsec/Argon_イオン衝突断面積.txt",
+  "base_dir": ".."
+}

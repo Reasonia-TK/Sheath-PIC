@@ -1,0 +1,10 @@
+"""SI constants; electron energies and temperature parameters use eV."""
+
+E_CHARGE = 1.602176634e-19
+M_E = 9.1093837139e-31
+EPSILON_0 = 8.8541878128e-12
+K_B = 1.380649e-23
+AMU = 1.66053906660e-27
+M_AR = 39.948 * AMU
+TOWNSEND = 1e-21
+MTORR_TO_PA = 0.13332236842105263
