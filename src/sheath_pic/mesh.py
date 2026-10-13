@@ -3,7 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 
 import numpy as np
-from scipy.sparse import coo_matrix
+from scipy.sparse import bmat, coo_matrix, csr_matrix, eye
 from scipy.sparse.linalg import spsolve
 
 from .config import Geometry, Plasma
@@ -14,6 +14,7 @@ from .inputs import density_expression, density_from_csv
 @dataclass
 class AxisymmetricMesh:
     geometry: Geometry
+    linear_backend: object | None = None
 
     def __post_init__(self) -> None:
         self.geometry.validate()
@@ -111,6 +112,13 @@ class AxisymmetricMesh:
             )
         )
         self._assemble_poisson()
+        self._prepare_sparse_layout()
+        if self.linear_backend is not None and self.linear_backend.name == "cuda":
+            pattern = self.poisson.copy()
+            pattern.data[:] = 1
+            self.linear_backend.register("poisson", pattern)
+            self.linear_backend.register("energy", pattern)
+            self.linear_backend.register("electron", self.jacobian_pattern)
 
     @property
     def cathode_area(self) -> float:
@@ -130,6 +138,47 @@ class AxisymmetricMesh:
         cols = np.concatenate((i, j, j, i, b))
         data = np.concatenate((conductance, conductance, -conductance, -conductance, bg))
         self.poisson = coo_matrix((data, (rows, cols)), shape=(self.size, self.size)).tocsr()
+
+    def _prepare_sparse_layout(self):
+        self.poisson.sort_indices()
+        self.stencil_rows = np.repeat(np.arange(self.size), np.diff(self.poisson.indptr))
+        keys = self.stencil_rows.astype(np.int64) * self.size + self.poisson.indices
+        self.diagonal_positions = np.searchsorted(keys, np.arange(self.size) * (self.size + 1))
+        self.ij_positions = np.searchsorted(keys, self.face_i * self.size + self.face_j)
+        self.ji_positions = np.searchsorted(keys, self.face_j * self.size + self.face_i)
+        pattern = self.poisson.copy()
+        pattern.data[:] = 1
+        self.jacobian_pattern = bmat([[pattern, eye(self.size)], [pattern, pattern]], format="csr")
+        self.jacobian_pattern.sort_indices()
+        width = 2 * self.size
+        rows = np.repeat(np.arange(width, dtype=np.int64), np.diff(self.jacobian_pattern.indptr))
+        jacobian_keys = rows * width + self.jacobian_pattern.indices
+        r, c = self.stencil_rows, self.poisson.indices
+        self.pp_positions = np.searchsorted(jacobian_keys, r * width + c)
+        self.pn_positions = np.searchsorted(
+            jacobian_keys, np.arange(self.size) * (width + 1) + self.size
+        )
+        self.np_positions = np.searchsorted(jacobian_keys, (r + self.size) * width + c)
+        self.nn_positions = np.searchsorted(jacobian_keys, (r + self.size) * width + c + self.size)
+
+    def stencil_matrix(self, values):
+        return csr_matrix(
+            (values, self.poisson.indices, self.poisson.indptr),
+            shape=self.poisson.shape,
+            copy=False,
+        )
+
+    def jacobian_matrix(self, row_scale, charge_scale, density_phi_data, density_matrix):
+        values = np.empty(self.jacobian_pattern.nnz)
+        values[self.pp_positions] = row_scale[self.stencil_rows] * self.poisson.data
+        values[self.pn_positions] = row_scale * charge_scale
+        values[self.np_positions] = density_phi_data
+        values[self.nn_positions] = density_matrix.data
+        return csr_matrix(
+            (values, self.jacobian_pattern.indices, self.jacobian_pattern.indptr),
+            shape=self.jacobian_pattern.shape,
+            copy=False,
+        )
 
     def boundary_voltage(self, wafer_voltage: float) -> np.ndarray:
         return np.where(self.boundary_cathode, wafer_voltage, 0.0)
@@ -153,7 +202,8 @@ class AxisymmetricMesh:
     def solve_poisson(
         self, ion_density: np.ndarray, electron_density: np.ndarray, wafer_voltage: float
     ) -> np.ndarray:
-        return spsolve(
+        return self.solve_linear(
+            "poisson",
             self.poisson,
             self.poisson_rhs(
                 ion_density,
@@ -161,6 +211,11 @@ class AxisymmetricMesh:
                 wafer_voltage,
             ),
         ).reshape(self.shape)
+
+    def solve_linear(self, key, matrix, rhs):
+        if self.linear_backend is None:
+            return spsolve(matrix, rhs)
+        return self.linear_backend.solve(key, matrix, rhs)
 
     def electric_field(self, potential: np.ndarray, wafer_voltage: float):
         er = -np.gradient(potential, self.r, axis=0, edge_order=2)

@@ -54,7 +54,7 @@ def save_field(path: Path, result: FieldResult) -> None:
         {
             name: getattr(result, name)
             for name in result.__dataclass_fields__
-            if name not in metadata_names
+            if name not in metadata_names and getattr(result, name) is not None
         },
         {name: getattr(result, name) for name in metadata_names},
     )
@@ -125,6 +125,7 @@ def field_fingerprint(project: dict, transport_key: str, waveform_hash: str = ""
         "angle_bins",
         "seed",
         "waveform_csv",
+        "backend",
     ):
         n.pop(key, None)
     payload = {"project": copy, "transport": transport_key, "waveform": waveform_hash}

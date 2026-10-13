@@ -18,16 +18,52 @@ Windows、Python 3.13、[uv](https://docs.astral.sh/uv/)を使用します。
 ```powershell
 cd C:\Works\20261013_Sheath-PIC
 $env:UV_CACHE_DIR = Join-Path (Get-Location) '.uv-cache'
-uv sync --locked
-uv run --locked python -m sheath_pic
+uv sync --locked --extra cuda
+uv run --locked --extra cuda python -m sheath_pic
 ```
 
 `launch.cmd`をダブルクリックしても起動できます。PowerShellからは`./launch.ps1`も使用できます。
+起動スクリプトは`nvidia-smi`がある環境でCUDA追加依存を読み込みます。
+CPU用の環境は`--extra cuda`を省いて同期・実行できます。
 初回の依存関係取得にはネットワークが必要です。
 実験波形などの手元データは`data/`または`measurements/`に置くとGitの対象から外れます。
 `examples/`の波形・密度は動作確認用の合成データです。
 実行開始は「1 電子物性」「2 2次元RF場」「3 IEDF / IADF / IAEDF」、または「すべて計算」です。
 計算は別プロセスで実行し、GUIから中断できます。
+
+## CUDAによる場計算
+
+「計算」タブで自動（CUDA優先）／CPU／CUDA GPUを選択できます。
+CUDA 13系のCuPyとNVIDIA cuDSSを使用し、Poisson、電子・Poisson連成Newton系、
+電子エネルギー式の疎行列を**FP64**で解きます。格子の疎行列構造、GPUバッファーと
+記号分解を再利用し、各回では数値と右辺を更新します。
+CuDSSに渡す行列は行・列のスケーリングを行い、残差を検査して必要なら反復改善します。
+式の組み立て、イオン流体の更新、Boltzpmp DC、MC粒子追跡はCPUで実行します。
+
+自動選択ではCUDAが利用できない場合にCPUを使い、理由を診断に記録します。
+CUDA GPUを指定した場合は、初期化失敗時にエラーを表示します。
+実際のGPU名、実行時間、線形残差、ライブラリ版は結果に保存します。
+
+RTX 5070 Ti（16 GB）での同条件比較：
+
+| 格子 | RF周期数 | 現行CPU | CUDA | CPUに対する速度比 |
+|---|---:|---:|---:|---:|
+| 24×40 | 4 | 46.8秒 | 21.8秒 | 2.14倍 |
+| 48×80 | 1 | 98.3秒 | 19.3秒 | 5.10倍 |
+
+Ar 10 mTorr、400 kHz、負側10 kVの合成波形、初期密度3×10¹⁶ m⁻³で計測しました。
+場計算の初期化を含み、DC計算と保存の時間は別です。CPUとCUDAは順番に実行しています。
+24×40・4周期の相対L2差は電位0.006%、電子密度0.013%、イオン密度0.013%でした。
+電子密度がピークの0.1%以上の領域でも、局所平均電子エネルギーには約1.8%の差が残ります。
+時間刻み・格子の収束が未確認の探索結果であり、GPU利用は物理精度の保証にはなりません。
+
+```powershell
+uv run --locked --extra cuda python scripts/benchmark_backends.py
+uv run --locked --extra cuda python -m sheath_pic.cli field --backend cuda
+```
+
+CPU/CUDAの比較結果は`artifacts/cuda-benchmark/report.json`と各場NPZに保存します。
+`--nr`、`--nz`、`--cycles`、`--project`、`--output`で条件を指定できます。
 
 最初の動作確認は「計算」タブの「粗い格子の動作確認設定」を押し、
 「未収束場で粒子計算を許可（探索用）」を選んで「すべて計算」を実行します。
@@ -103,6 +139,12 @@ EEDFそのものを2次元で時間発展させる計算は含みません。
 低圧で過大な電子ドリフト流束が出ることを防ぐ自由飛行型の流束制限を使用します。
 この閉包も物理近似です。電子仕事の負成分は陰的に線形化し、適用後の仕事と生の`j·E`の差を記録します。
 電子エネルギーのガス熱平衡床への補正も記録します。
+極小密度で平均エネルギーが発散して周囲の輸送を不安定にすることを避けるため、
+構成則に渡す平均エネルギーの分母には基準密度の10⁻⁸の下限を使用します。
+電子密度自体をこの値に引き上げる処理ではありません。
+下限は`numerics.electron_density_floor_fraction`で指定し、数値条件の指紋に含めます。
+下限より密度が低いセルの平均エネルギーは構成則用の近似値です。
+生の電子エネルギー密度も`field.npz`に保存します。
 **離散式のエネルギー収支が閉じることは、物理モデルの正しさを保証しません。**
 
 準中性の基準は`|ni-ne|/(ni+ne)<0.05`とし、隣接境界セル・電子欠乏領域を除いた
@@ -139,7 +181,7 @@ EEDFそのものを2次元で時間発展させる計算は含みません。
 |---|---|
 | `project.json`, `inputs/` | 再実行用条件と入力ファイルのコピー |
 | `transport.npz` | DC物性とEEDF、断面積・設定・版の記録 |
-| `field.npz` | 最終完了周期の電位、電場、密度、電子エネルギー、イオン速度 |
+| `field.npz` | 最終完了周期の電位、電場、密度、平均電子エネルギー、生の電子エネルギー密度、イオン速度 |
 | `field_diagnostics.json` | 周期誤差、保存則、物性範囲、近似の記録 |
 | `checkpoint.npz` | 最後に完了した周期の状態 |
 | `plasma_potential.csv` | 代表プラズマ電位と準中性領域の有無 |
@@ -166,6 +208,7 @@ uv run --locked python -m sheath_pic.cli field --project examples/quick-project.
 uv run --locked python -m sheath_pic.cli all --quick --allow-unconverged
 uv run --locked python -m pytest -q
 uv run --locked python -m ruff check src tests scripts
+uv run --locked --extra cuda python -m pytest -q
 ```
 
 `--quick`と`--allow-unconverged`は粗い格子での動作確認・探索用です。
@@ -175,6 +218,8 @@ uv run --locked python -m ruff check src tests scripts
 衝突のエネルギー・運動量保存、無衝突一様電場のイオンエネルギー、分布の正規化と周辺分布、
 seed再現性、チェックポイント再開、GUIテーマ・CSV列選択を対象にしています。
 GUIの実ワーカー経路と両テーマの描画は`uv run --locked python scripts/gui_smoke.py --run`で確認できます。
+CUDAを含むGUI検証は`uv run --locked --extra cuda python scripts/gui_smoke.py --run`です。
+CUDA追加依存・GPUのない環境ではGPU専用テストをskipし、CPUと選択動作を確認します。
 GitHubへのpush時にもWindows上で同じテストと静的検査を実行します。
 CIの依存環境は[uvの公式GitHub Actions手順](https://docs.astral.sh/uv/guides/integration/github/)に従います。
 
@@ -186,3 +231,8 @@ CIの依存環境は[uvの公式GitHub Actions手順](https://docs.astral.sh/uv/
 [GECセルの2次元RFモデル](https://pmc.ncbi.nlm.nih.gov/articles/PMC4887236/)、
 [EST/PIC比較](https://arxiv.org/abs/1305.6786)、
 [Phelpsの散乱解説](https://us.lxcat.net/notes/index.php?download=phelps3)。
+
+CUDA実装の参考：[CuPyインストール](https://docs.cupy.dev/en/stable/install.html)、
+[cuDSSのワークフロー](https://docs.nvidia.com/cuda/cudss/getting_started.html)、
+[cuDSSの精度・性能の注意点](https://docs.nvidia.com/cuda/cudss/tips_and_tricks.html)。
+外部ライブラリの告知は[THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md)に保持しています。

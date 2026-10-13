@@ -17,10 +17,13 @@ def main():
     parser.add_argument("--output", type=Path)
     parser.add_argument("--field", type=Path)
     parser.add_argument("--resume", type=Path)
+    parser.add_argument("--backend", choices=["auto", "cpu", "cuda"])
     parser.add_argument("--quick", action="store_true", help="粗い格子・2周期の数値動作確認")
     parser.add_argument("--allow-unconverged", action="store_true")
     args = parser.parse_args()
     project = Project.load(args.project) if args.project else Project(base_dir=str(Path.cwd()))
+    if args.backend:
+        project.numerics.backend = args.backend
     if args.quick:
         project.geometry.radial_cells = 8
         project.geometry.axial_cells = 12

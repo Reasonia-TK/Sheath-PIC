@@ -62,6 +62,7 @@ def test_distributions_are_marginals_and_flux_weights_use_ring_area():
 
 def test_10kv_coupled_solver_budgets_and_checkpoint_restart(dc_table, tmp_path):
     project = Project(base_dir=str(ROOT))
+    project.numerics.backend = "cpu"
     project.geometry.radial_cells = 4
     project.geometry.axial_cells = 6
     project.numerics.minimum_cycles = 1
@@ -220,6 +221,7 @@ def test_archived_project_is_relocatable_and_column_mapping_is_part_of_field_ide
 
 def test_maintained_nonuniform_density_and_secondary_sources_preserve_budgets(dc_table):
     project = Project(base_dir=str(ROOT))
+    project.numerics.backend = "cpu"
     project.geometry.radial_cells = 4
     project.geometry.axial_cells = 6
     project.plasma.density_profile = "expression"

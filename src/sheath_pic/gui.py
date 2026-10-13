@@ -408,6 +408,12 @@ class MainWindow(QMainWindow):
 
     def _numerics_form(self):
         form = self._form("計算")
+        self._choice(
+            form,
+            "backend",
+            "場計算の実行環境",
+            [("自動（CUDA優先）", "auto"), ("CPU", "cpu"), ("CUDA GPU", "cuda")],
+        )
         for key, label, low, high in (
             ("nr", "rセル数", 4, 160),
             ("nz", "zセル数", 4, 240),
@@ -475,6 +481,7 @@ class MainWindow(QMainWindow):
             "gamma_g": p.ground_secondary_yield,
             "sticking": p.electron_sticking,
             "ion_energy_frame": p.ion_energy_frame,
+            "backend": n.backend,
             "nr": g.radial_cells,
             "nz": g.axial_cells,
             "min_cycles": n.minimum_cycles,
@@ -544,6 +551,7 @@ class MainWindow(QMainWindow):
         p.cathode_secondary_yield, p.ground_secondary_yield = val("gamma_c"), val("gamma_g")
         p.electron_sticking, p.ion_energy_frame = val("sticking"), choice("ion_energy_frame")
         n.frequency_hz, n.demo_negative_peak_v = val("frequency") * 1000, val("peak") * 1000
+        n.backend = choice("backend")
         for attr, key in (
             ("minimum_cycles", "min_cycles"),
             ("maximum_cycles", "max_cycles"),
@@ -862,10 +870,15 @@ class MainWindow(QMainWindow):
         lines = []
         if self.field is not None:
             d = self.field.diagnostics
+            backend = d.get("backend", {})
             lines.extend(
                 [
                     "RF場の数値診断",
                     "",
+                    f"実行環境：{backend.get('actual', 'cpu')} / {backend.get('device', 'CPU')}",
+                    "精度：FP64 / 場計算時間："
+                    f"{d.get('elapsed_total_s', d.get('elapsed_s', 0)):.3f} 秒",
+                    f"線形解法の時間：{backend.get('linear_solve_seconds', 0):.3f} 秒",
                     f"周期収束：{'許容値を満たす' if d['periodic_converged'] else '未収束'}",
                     f"停止理由：{d['stop_reason']}",
                     f"完了周期：{d['completed_cycles']} / 最終周期誤差：{d['periodic_error']:.4g}",
@@ -888,6 +901,7 @@ class MainWindow(QMainWindow):
                     f"電子断面積 SHA-256：{d['electron_xsec_sha256']}",
                     f"イオン断面積 SHA-256：{d['ion_xsec_sha256']}",
                     f"波形：{d['source_waveform']}",
+                    f"CUDA初期化情報：{backend.get('unavailable_reason') or '問題なし'}",
                 ]
             )
         if self.particles is not None:

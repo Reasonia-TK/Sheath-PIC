@@ -16,11 +16,13 @@ def test_gui_preserves_loaded_numeric_precision_and_themes(tmp_path):
     window = MainWindow(workspace)
     project = Project(base_dir=str(workspace))
     project.geometry.chamber_radius_m = 0.278901234567
+    project.numerics.backend = "cuda"
     project.plasma.density_m3 = 1.234567891234e16
     window.project = project
     window._populate(project)
     assert window.collect_project().geometry.chamber_radius_m == project.geometry.chamber_radius_m
     assert window.collect_project().plasma.density_m3 == project.plasma.density_m3
+    assert window.collect_project().numerics.backend == "cuda"
     for theme in ("light", "dark", "system"):
         window.theme_combo.setCurrentIndex(window.theme_combo.findData(theme))
         app.processEvents()

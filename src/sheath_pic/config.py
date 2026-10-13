@@ -64,6 +64,8 @@ class Plasma:
 
 @dataclass
 class Numerics:
+    backend: str = "auto"
+    electron_density_floor_fraction: float = 1e-8
     frequency_hz: float = 400e3
     demo_negative_peak_v: float = 10000.0
     waveform_csv: str = ""
@@ -87,6 +89,10 @@ class Numerics:
     angle_bins: int = 90
 
     def validate(self) -> None:
+        if self.backend not in {"auto", "cpu", "cuda"}:
+            raise ValueError("計算バックエンドはauto、cpu、cudaから選択してください。")
+        if not 0 < self.electron_density_floor_fraction <= 1e-4:
+            raise ValueError("電子エネルギーの密度床は0より大きく1e-4以下にしてください。")
         if self.frequency_hz <= 0 or self.demo_negative_peak_v <= 0:
             raise ValueError("周波数と負側ピークの大きさは正の値が必要です。")
         if not 1 <= self.minimum_cycles <= self.maximum_cycles <= 200:

@@ -5,12 +5,11 @@ from collections.abc import Callable
 from dataclasses import dataclass
 
 import numpy as np
-from scipy.sparse import bmat, coo_matrix, diags, eye
-from scipy.sparse.linalg import spsolve
 
 from .config import Project
 from .constants import E_CHARGE, EPSILON_0, K_B, M_AR, M_E
 from .inputs import Waveform
+from .linear import LinearBackend
 from .mesh import AxisymmetricMesh
 from .transport import Progress, TransportTable
 from .xsections import IonCrossSections
@@ -58,6 +57,7 @@ class FieldResult:
     project: dict
     waveform_time_s: np.ndarray
     waveform_voltage_v: np.ndarray
+    electron_energy_density_j_m3: np.ndarray | None = None
 
     @property
     def converged(self) -> bool:
@@ -119,16 +119,15 @@ def electron_operator(
     vi, vj = mesh.volume.ravel()[i], mesh.volume.ravel()[j]
     fa = dt * mesh.face_area
     ba = dt * mesh.boundary_area / mesh.volume.ravel()[bc]
-    rows = np.concatenate((i, i, j, j, bc))
-    cols = np.concatenate((i, j, i, j, bc))
-    values = np.concatenate((fa * a / vi, -fa * b / vi, -fa * a / vj, fa * b / vj, ba * wall_rate))
-    matrix = (
-        eye(mesh.size, format="csr")
-        + coo_matrix(
-            (values, (rows, cols)),
-            shape=(mesh.size, mesh.size),
-        ).tocsr()
-    )
+    values = np.zeros(mesh.poisson.nnz)
+    values[mesh.ij_positions] = -fa * b / vi
+    values[mesh.ji_positions] = -fa * a / vj
+    diagonal = np.ones(mesh.size)
+    np.add.at(diagonal, i, fa * a / vi)
+    np.add.at(diagonal, j, fa * b / vj)
+    np.add.at(diagonal, bc, ba * wall_rate)
+    values[mesh.diagonal_positions] = diagonal
+    matrix = mesh.stencil_matrix(values)
     return ElectronOperator(
         matrix, a, b, np.column_stack((da, db)), wall_rate, wall_derivative, float(limited.mean())
     )
@@ -164,8 +163,6 @@ def solve_electron_poisson(
     poisson_ion = mesh.poisson_rhs(ion_density, np.zeros(mesh.shape), wafer_voltage)
     charge_scale = E_CHARGE / EPSILON_0 * density_scale * vol
     row_scale = 1 / (mesh.poisson.diagonal() * np.maximum(mean_energy.ravel(), 0.03) + charge_scale)
-    jp_phi = diags(row_scale) @ mesh.poisson
-    jp_n = diags(row_scale * charge_scale)
     i, j, bc = mesh.face_i, mesh.face_j, mesh.boundary_cell
 
     def evaluate(p, n):
@@ -199,22 +196,22 @@ def solve_electron_poisson(
         fi = dt * mesh.face_area * derivative / vol[i]
         fj = dt * mesh.face_area * derivative / vol[j]
         fb = dt * mesh.boundary_area / vol[bc] * op.boundary_derivative * density[bc]
-        jn_phi = coo_matrix(
-            (
-                np.concatenate((-fi, fi, fj, -fj, fb)),
-                (
-                    np.concatenate((i, i, j, j, bc)),
-                    np.concatenate((i, j, i, j, bc)),
-                ),
-            ),
-            shape=(mesh.size, mesh.size),
-        ).tocsr()
-        jacobian = bmat([[jp_phi, jp_n], [jn_phi, op.matrix]], format="csc")
-        delta = spsolve(jacobian, -residual)
+        density_phi_data = np.zeros(mesh.poisson.nnz)
+        density_phi_data[mesh.ij_positions] = fi
+        density_phi_data[mesh.ji_positions] = fj
+        diagonal = np.zeros(mesh.size)
+        np.add.at(diagonal, i, -fi)
+        np.add.at(diagonal, j, -fj)
+        np.add.at(diagonal, bc, fb)
+        density_phi_data[mesh.diagonal_positions] = diagonal
+        jacobian = mesh.jacobian_matrix(row_scale, charge_scale, density_phi_data, op.matrix)
+        delta = mesh.solve_linear("electron", jacobian, -residual)
         if not np.all(np.isfinite(delta)):
             raise ArithmeticError("電子・Poisson連成の線形解が有限ではありません。")
         dp, dn = delta[: mesh.size], delta[mesh.size :]
-        negative = dn < 0
+        # Near-vacuum density corrections are below the nonlinear residual scale.
+        # Their roundoff must not throttle the entire Newton step or its time step.
+        negative = (dn < 0) & (density > 1e-12)
         alpha = (
             min(1.0, float(np.min(-0.98 * density[negative] / dn[negative])))
             if np.any(negative)
@@ -222,7 +219,8 @@ def solve_electron_poisson(
         )
         accepted = False
         for _ in range(16):
-            pn, nn = phi + alpha * dp, density + alpha * dn
+            pn = phi + alpha * dp
+            nn = np.maximum(density + alpha * dn, 1e-18)
             new_op, new_residual, new_norm = evaluate(pn, nn)
             if new_norm < norm * (1 - 1e-4 * alpha) or new_norm < tolerance:
                 phi, density, op, residual, norm = pn, nn, new_op, new_residual, new_norm
@@ -341,18 +339,14 @@ def electron_energy_step(
     work_loss_rate = np.maximum(-work, 0) / np.maximum(old_w, 1e-30)
     loss = inelastic_rate + elastic_rate + work_loss_rate
     # Enthalpy transport uses 5/3; Maxwell wall losses use 2 Te = 4/3 <eps>.
-    interior = op.matrix - eye(mesh.size, format="csr")
     wall_diagonal = np.bincount(
         bc, weights=dt * mesh.boundary_area / vol[bc] * op.boundary_rate, minlength=mesh.size
     )
-    matrix = (
-        eye(mesh.size, format="csr")
-        + (5 / 3) * interior
-        - diags(wall_diagonal / 3)
-        + diags(dt * loss)
-    )
+    matrix_data = (5 / 3) * op.matrix.data
+    matrix_data[mesh.diagonal_positions] += -2 / 3 - wall_diagonal / 3 + dt * loss
+    matrix = mesh.stencil_matrix(matrix_data)
     rhs = old_w + dt * (np.maximum(work, 0) + source_energy_ev_m3_s.ravel() / density_scale)
-    new_w = spsolve(matrix, rhs)
+    new_w = mesh.solve_linear("energy", matrix, rhs)
     if not np.all(np.isfinite(new_w)) or np.min(new_w) < -1e-8:
         raise ArithmeticError("電子エネルギー式で非物理的な解が生じました。")
     thermal_floor = 1.5 * K_B * gas_temperature / E_CHARGE * scaled_ne
@@ -407,10 +401,23 @@ def run_fields(
     checkpoint: Callable[[dict], None] | None = None,
     restart: dict | None = None,
 ) -> FieldResult:
+    started = time.perf_counter()
+    with LinearBackend(project.numerics.backend) as backend:
+        progress_callback = progress or (lambda *_: None)
+        progress_callback(0, f"計算環境：{backend.name} / {backend.device} / FP64")
+        result = _run_fields(
+            project, table, waveform, progress, cancelled, checkpoint, restart, backend
+        )
+        result.diagnostics["backend"] = backend.metadata()
+        result.diagnostics["elapsed_total_s"] = time.perf_counter() - started
+        return result
+
+
+def _run_fields(project, table, waveform, progress, cancelled, checkpoint, restart, linear_backend):
     project.validate()
     progress = progress or (lambda *_: None)
     cancelled = cancelled or (lambda: False)
-    mesh = AxisymmetricMesh(project.geometry)
+    mesh = AxisymmetricMesh(project.geometry, linear_backend)
     p, cfg = project.plasma, project.numerics
     neutral_density = p.pressure_pa / (K_B * p.gas_temperature_k)
     ion_xsec = IonCrossSections.load(project.path(project.ion_xsec), p.ion_energy_frame)
@@ -462,6 +469,7 @@ def run_fields(
     phases = np.arange(cfg.stored_phases) * period / cfg.stored_phases
     lower_energy, upper_energy = table.energy_range
     thermal_energy = 1.5 * K_B * p.gas_temperature_k / E_CHARGE
+    energy_density_floor = scale * cfg.electron_density_floor_fraction
     start_time = time.monotonic()
     converged = False
     stop_reason = "最大周期数に到達"
@@ -491,20 +499,30 @@ def run_fields(
         begin_state = [array.copy() for array in (ne, ni, w, phi)]
         time_in_cycle = 0.0
         phase_index = 0
-        frames = {name: [] for name in ("phi", "ne", "ni", "energy", "ur", "uz")}
+        frames = {name: [] for name in ("phi", "ne", "ni", "energy", "ur", "uz", "w")}
         last_progress = time.monotonic() - 1
         while time_in_cycle < period * (1 - 1e-12):
             if cancelled():
                 raise InterruptedError("場計算を中断しました。直近の完了周期から再開できます。")
             current_time = cycle * period + time_in_cycle
             old_v = float(waveform.at(current_time))
-            energy = np.maximum(w / (E_CHARGE * np.maximum(ne, scale * 1e-18)), thermal_energy)
+            energy = np.maximum(
+                w / (E_CHARGE * np.maximum(ne, energy_density_floor)), thermal_energy
+            )
             while (
                 phase_index < len(phases) and phases[phase_index] <= time_in_cycle + period * 1e-12
             ):
                 for name, array in zip(
                     frames,
-                    (phi, ne, ni, energy, pr / np.maximum(ni, 1e-30), pz / np.maximum(ni, 1e-30)),
+                    (
+                        phi,
+                        ne,
+                        ni,
+                        energy,
+                        pr / np.maximum(ni, 1e-30),
+                        pz / np.maximum(ni, 1e-30),
+                        w,
+                    ),
                     strict=True,
                 ):
                     frames[name].append(array.copy())
@@ -666,7 +684,7 @@ def run_fields(
                 counters["maximum_limited_face_fraction"],
                 operator.limited_fraction,
             )
-            new_energy = w / (E_CHARGE * np.maximum(ne, scale * 1e-18))
+            new_energy = w / (E_CHARGE * np.maximum(ne, energy_density_floor))
             outside = (new_energy < lower_energy) | (new_energy > upper_energy)
             outside_fraction = float(
                 np.sum(ne[outside] * mesh.volume[outside]) / max(np.sum(ne * mesh.volume), 1)
@@ -750,6 +768,7 @@ def run_fields(
         "イオン場は等温流体・衝突摩擦近似。テスト粒子密度は場にフィードバックしません。",
         "断面積のイオンエネルギー軸（重心系/実験室系）は利用者による確認が必要です。",
         "格子・時間刻み・粒子数の収束確認と実験照合は別途必要です。",
+        "電子がほぼ枯渇したセルの平均エネルギーには密度床を使用しています。",
     ]
     work_difference = abs(counters["field_work_j"] - counters["field_work_raw_j"]) / max(
         abs(counters["field_work_j"]) + abs(counters["field_work_raw_j"]),
@@ -801,6 +820,7 @@ def run_fields(
         transport_cache_key=table.metadata["cache_key"],
         boltzpmp_version=table.metadata["boltzpmp_version"],
         density_mode=p.density_mode,
+        electron_energy_density_floor_m3=energy_density_floor,
         warnings=warnings_list,
         field_model="axisymmetric ion Euler / SG electron continuity + energy / coupled Poisson",
         bottom_annulus_boundary="insulating, zero normal particle and electric flux",
@@ -828,4 +848,5 @@ def run_fields(
         project.to_dict(),
         waveform.time_s,
         waveform.voltage_v,
+        final_frames["w"],
     )
