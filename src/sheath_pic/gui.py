@@ -100,17 +100,22 @@ class MainWindow(QMainWindow):
         self.project = Project(base_dir=str(self.workspace))
         self.settings_path = self.workspace / ".cache" / "ui-settings.json"
         self.theme_request = "system"
+        self.angle_request = "polar"
         if self.settings_path.exists():
             try:
-                self.theme_request = json.loads(self.settings_path.read_text()).get(
-                    "theme", "system"
-                )
+                settings = json.loads(self.settings_path.read_text(encoding="utf-8"))
+                self.theme_request = settings.get("theme", "system")
+                self.angle_request = settings.get("particle_angle", "polar")
+                if self.angle_request not in {"polar", "signed_meridional"}:
+                    self.angle_request = "polar"
             except (ValueError, OSError):
                 pass
         self.mode = "light"
         self.table = None
         self.field = None
         self.particles = None
+        self._angle_result = None
+        self._angle_views = {}
         self.result_directory = None
         self.field_path = None
         self.current_directory = None
@@ -260,9 +265,26 @@ class MainWindow(QMainWindow):
                 self.particle_summary.setWordWrap(True)
                 tools.addWidget(self.particle_summary, 1)
                 export = QPushButton("分布CSVを保存")
+                export.setToolTip("極角と、保存されていれば符号付き断面内角度のCSVを出力します。")
                 export.clicked.connect(self.export_csv)
                 tools.addWidget(export)
                 box.addLayout(tools)
+                angle_tools = QHBoxLayout()
+                angle_tools.addWidget(QLabel("角度定義"))
+                self.angle_combo = QComboBox()
+                self.angle_combo.addItem("3次元極角 (0～90°)", "polar")
+                self.angle_combo.addItem("符号付き断面内角 (−90～90°)", "signed_meridional")
+                self.angle_combo.setCurrentIndex(self.angle_combo.findData(self.angle_request))
+                self.angle_combo.setToolTip(
+                    "断面内角度は atan2(vr, |vz|)。半径外向きが正、中心向きが負です。"
+                )
+                self.angle_combo.currentIndexChanged.connect(self.angle_changed)
+                angle_tools.addWidget(self.angle_combo)
+                self.angle_help = QLabel()
+                self.angle_help.setWordWrap(True)
+                self.angle_help.setProperty("muted", True)
+                angle_tools.addWidget(self.angle_help, 1)
+                box.addLayout(angle_tools)
             figure, canvas = _canvas()
             self.figures[key] = (figure, canvas)
             box.addWidget(canvas, 1)
@@ -583,7 +605,7 @@ class MainWindow(QMainWindow):
                 "font.family": ["Yu Gothic", "Meiryo", "DejaVu Sans"],
             }
         )
-        write_json(self.settings_path, {"theme": self.theme_request})
+        self.save_ui_settings()
         for figure, canvas in self.figures.values():
             style_figure(figure, self.mode)
             canvas.draw_idle()
@@ -592,6 +614,17 @@ class MainWindow(QMainWindow):
         self.draw_particles()
         if self.table is not None or self.field is not None:
             self.preview_inputs()
+
+    def save_ui_settings(self):
+        write_json(
+            self.settings_path,
+            {"theme": self.theme_request, "particle_angle": self.angle_request},
+        )
+
+    def angle_changed(self, *_):
+        self.angle_request = self.angle_combo.currentData()
+        self.save_ui_settings()
+        self.draw_particles()
 
     def system_theme_changed(self, *_):
         if self.theme_request == "system":
@@ -914,12 +947,18 @@ class MainWindow(QMainWindow):
                     f"接地面損失：{d['lost_ground']:,} / 打切り：{d['timed_out']:,}",
                     f"外部対除去による損失：{d.get('lost_external', 0):,}",
                     f"平均エネルギー：{d['mean_energy_ev']:.4g} eV",
-                    f"平均角度：{d['mean_angle_deg']:.4g}°",
+                    f"平均極角：{d['mean_angle_deg']:.4g}°",
                     f"平均衝突数：{d['mean_collision_count']:.4g} / seed：{d['seed']}",
                     f"供給源：{d['source']}",
                     *[f"・{message}" for message in d["warnings"]],
                 ]
             )
+            if self.particles.arrival_meridional_angle_deg is not None:
+                lines.append(
+                    "平均符号付き断面内角："
+                    f"{self.particles.arrival_meridional_angle_deg.mean():+.4g}°"
+                    " / +r外向き、−r中心向き"
+                )
         if self.table is not None:
             lines.extend(
                 [
@@ -1192,7 +1231,34 @@ class MainWindow(QMainWindow):
     def draw_particles(self, *_):
         figure, canvas = self.figures["particles"]
         figure.clear()
+        signed_available = (
+            self.particles is None or self.particles.arrival_meridional_angle_deg is not None
+        )
+        self.angle_combo.model().item(self.angle_combo.findData("signed_meridional")).setEnabled(
+            signed_available
+        )
+        if self._angle_result is not self.particles or (
+            not signed_available and self.angle_combo.currentData() == "signed_meridional"
+        ):
+            self._angle_result = self.particles
+            self._angle_views.clear()
+            preferred = self.angle_request if signed_available else "polar"
+            blocked = self.angle_combo.blockSignals(True)
+            self.angle_combo.setCurrentIndex(self.angle_combo.findData(preferred))
+            self.angle_combo.blockSignals(blocked)
+        mode = self.angle_combo.currentData()
+        signed = mode == "signed_meridional"
+        self.angle_help.setText(
+            "旧結果の符号付き角度は、粒子計算を再実行すると選択できます。"
+            if not signed_available
+            else (
+                "正：半径外向き ／ 負：中心向き。方位方向の速度は含みません。"
+                if signed
+                else "3次元速度から求めた極角。方位方向の速度も含みます。"
+            )
+        )
         if self.particles is None:
+            self.particle_summary.setText("場計算後にイオンを追跡します。")
             ax = figure.add_subplot()
             ax.text(
                 0.5,
@@ -1205,16 +1271,19 @@ class MainWindow(QMainWindow):
             ax.set_axis_off()
         else:
             result = self.particles
+            if mode not in self._angle_views:
+                self._angle_views[mode] = result.angular_distribution(mode)
+            angular = self._angle_views[mode]
             selected = self.radial_combo.currentIndex() - 1
             if selected >= 0:
-                joint = result.radial_iaedf[selected]
-                counts = result.counts[selected]
+                joint = angular.radial_iaedf[selected]
+                counts = angular.counts[selected]
             else:
-                joint = result.iaedf
-                counts = result.counts.sum(axis=0)
-            de, da = np.diff(result.energy_edges_ev), np.diff(result.angle_edges_deg)
+                joint = angular.iaedf
+                counts = angular.counts.sum(axis=0)
+            de, da = np.diff(result.energy_edges_ev), np.diff(angular.angle_edges_deg)
             energy = 0.5 * (result.energy_edges_ev[1:] + result.energy_edges_ev[:-1])
-            angle = 0.5 * (result.angle_edges_deg[1:] + result.angle_edges_deg[:-1])
+            angle = 0.5 * (angular.angle_edges_deg[1:] + angular.angle_edges_deg[:-1])
             iedf, iadf = np.sum(joint * da[None, :], axis=1), np.sum(joint * de[:, None], axis=0)
             a, b, c, d = figure.subplots(2, 2).ravel()
             a.plot(energy, iedf, color=SERIES[self.mode][0])
@@ -1231,16 +1300,22 @@ class MainWindow(QMainWindow):
                 )
             a.set(xlabel="Energy [eV]", ylabel="PDF [eV⁻¹]", title="IEDF")
             b.plot(angle, iadf, color=SERIES[self.mode][1])
-            b.set(xlabel="Angle from wafer normal [deg]", ylabel="PDF [deg⁻¹]", title="IADF")
+            angle_label = "Signed meridional angle [deg]" if signed else "3D polar angle [deg]"
+            b.set(
+                xlabel=angle_label,
+                ylabel="PDF [deg⁻¹]",
+                title="IADF",
+                xlim=(angular.angle_edges_deg[0], angular.angle_edges_deg[-1]),
+            )
             image = c.pcolormesh(
                 result.energy_edges_ev,
-                result.angle_edges_deg,
+                angular.angle_edges_deg,
                 joint.T,
                 cmap="viridis",
                 shading="flat",
             )
             figure.colorbar(image, ax=c, label="PDF [eV⁻¹ deg⁻¹]")
-            c.set(xlabel="Energy [eV]", ylabel="Angle [deg]", title="IAEDF")
+            c.set(xlabel="Energy [eV]", ylabel=angle_label, title="IAEDF")
             radius = 0.5 * (result.radius_edges_m[1:] + result.radius_edges_m[:-1])
             if np.isfinite(result.radial_flux_m2_s).any():
                 d.plot(
@@ -1257,12 +1332,27 @@ class MainWindow(QMainWindow):
                 d.set_ylabel("Arrived particles")
             d.set(xlabel="Wafer radius [mm]", title="Radial arrival flux")
             stats = result.diagnostics
-            self.particle_summary.setText(
-                ("探索結果 · " if not stats["field_periodic_converged"] else "")
-                + f"到達 {stats['arrived']:,} / {stats['injected']:,} · "
-                f"平均 {stats['mean_energy_ev']:.1f} eV · "
-                f"{stats['mean_angle_deg']:.2f}°"
-            )
+            summary = "探索結果 · " if not stats["field_periodic_converged"] else ""
+            summary += f"到達 {int(total):,}"
+            if selected < 0:
+                summary += f" / {stats['injected']:,}"
+            if total:
+                selected_ions = np.ones(len(result.arrival_energy_ev), dtype=bool)
+                if selected >= 0:
+                    selected_ions &= result.arrival_radius_m >= result.radius_edges_m[selected]
+                    if selected == len(result.radius_edges_m) - 2:
+                        selected_ions &= (
+                            result.arrival_radius_m <= result.radius_edges_m[selected + 1]
+                        )
+                    else:
+                        selected_ions &= (
+                            result.arrival_radius_m < result.radius_edges_m[selected + 1]
+                        )
+                angles = result.arrival_meridional_angle_deg if signed else result.arrival_angle_deg
+                mean_angle = float(angles[selected_ions].mean())
+                summary += f" · 平均 {result.arrival_energy_ev[selected_ions].mean():.1f} eV · "
+                summary += f"断面内 {mean_angle:+.2f}°" if signed else f"極角 {mean_angle:.2f}°"
+            self.particle_summary.setText(summary)
         style_figure(figure, self.mode)
         canvas.draw_idle()
 

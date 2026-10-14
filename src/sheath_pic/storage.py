@@ -177,7 +177,6 @@ def plasma_observables(field: FieldResult, mesh) -> dict:
 def export_distributions(directory: Path, result: ParticleResult) -> None:
     directory.mkdir(parents=True, exist_ok=True)
     energy = 0.5 * (result.energy_edges_ev[1:] + result.energy_edges_ev[:-1])
-    angle = 0.5 * (result.angle_edges_deg[1:] + result.angle_edges_deg[:-1])
     radius = 0.5 * (result.radius_edges_m[1:] + result.radius_edges_m[:-1])
     np.savetxt(
         directory / "iedf.csv",
@@ -186,21 +185,31 @@ def export_distributions(directory: Path, result: ParticleResult) -> None:
         header="energy_eV,pdf_per_eV",
         comments="",
     )
-    np.savetxt(
-        directory / "iadf.csv",
-        np.column_stack((angle, result.iadf)),
-        delimiter=",",
-        header="angle_deg,pdf_per_degree",
-        comments="",
-    )
-    ee, aa = np.meshgrid(energy, angle, indexing="ij")
-    np.savetxt(
-        directory / "iaedf.csv",
-        np.column_stack((ee.ravel(), aa.ravel(), result.iaedf.ravel())),
-        delimiter=",",
-        header="energy_eV,angle_deg,pdf_per_eV_per_degree",
-        comments="",
-    )
+    exported_angles = {}
+    for mode, suffix, column in (
+        ("polar", "", "angle_deg"),
+        ("signed_meridional", "_signed", "signed_meridional_angle_deg"),
+    ):
+        if mode == "signed_meridional" and result.arrival_meridional_angle_deg is None:
+            continue
+        angular = result.angular_distribution(mode)
+        angle = 0.5 * (angular.angle_edges_deg[1:] + angular.angle_edges_deg[:-1])
+        np.savetxt(
+            directory / f"iadf{suffix}.csv",
+            np.column_stack((angle, angular.iadf)),
+            delimiter=",",
+            header=f"{column},pdf_per_degree",
+            comments="",
+        )
+        ee, aa = np.meshgrid(energy, angle, indexing="ij")
+        np.savetxt(
+            directory / f"iaedf{suffix}.csv",
+            np.column_stack((ee.ravel(), aa.ravel(), angular.iaedf.ravel())),
+            delimiter=",",
+            header=f"energy_eV,{column},pdf_per_eV_per_degree",
+            comments="",
+        )
+        exported_angles[f"iadf{suffix}.csv / iaedf{suffix}.csv"] = mode
     np.savetxt(
         directory / "radial_flux.csv",
         np.column_stack((radius * 1000, result.radial_flux_m2_s)),
@@ -208,19 +217,25 @@ def export_distributions(directory: Path, result: ParticleResult) -> None:
         header="radius_mm,ion_flux_m2_s",
         comments="",
     )
+    arrivals = [
+        result.arrival_energy_ev,
+        result.arrival_angle_deg,
+        result.arrival_radius_m * 1000,
+        result.arrival_phase_s,
+        result.arrival_collisions,
+    ]
+    arrival_header = "energy_eV,angle_deg,radius_mm,phase_s,collisions"
+    if result.arrival_meridional_angle_deg is not None:
+        arrivals.append(result.arrival_meridional_angle_deg)
+        arrival_header += ",signed_meridional_angle_deg"
     np.savetxt(
         directory / "arrivals.csv",
-        np.column_stack(
-            (
-                result.arrival_energy_ev,
-                result.arrival_angle_deg,
-                result.arrival_radius_m * 1000,
-                result.arrival_phase_s,
-                result.arrival_collisions,
-            )
-        ),
+        np.column_stack(arrivals),
         delimiter=",",
-        header="energy_eV,angle_deg,radius_mm,phase_s,collisions",
+        header=arrival_header,
         comments="",
     )
-    write_json(directory / "particle_diagnostics.json", result.diagnostics)
+    write_json(
+        directory / "particle_diagnostics.json",
+        {**result.diagnostics, "exported_angle_definitions": exported_angles},
+    )

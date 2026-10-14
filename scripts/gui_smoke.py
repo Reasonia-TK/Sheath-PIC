@@ -3,6 +3,7 @@
 import argparse
 import os
 import time
+from dataclasses import replace
 from pathlib import Path
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
@@ -17,19 +18,31 @@ from sheath_pic.gui import MainWindow
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--run", action="store_true")
+    parser.add_argument(
+        "--particles-only",
+        action="store_true",
+        help="With --run, reuse --results field for 2000 ions",
+    )
     parser.add_argument("--results", type=Path, default=Path("artifacts/quick"))
     args = parser.parse_args()
+    if args.particles_only and not args.run:
+        parser.error("--particles-onlyには--runが必要です。")
     app = QApplication.instance() or QApplication([])
     window = MainWindow()
     original_theme = window.theme_combo.currentData()
+    original_angle = window.angle_request
     errors = []
     window.error = errors.append
     window.resize(1450, 960)
     window.show()
     if args.run:
-        window.quick_settings()
+        if args.particles_only:
+            window.load_result_directory(args.results)
+            window.controls["particles"].setValue(2000)
+        else:
+            window.quick_settings()
         window.allow_unconverged.setChecked(True)
-        window.start_run("all")
+        window.start_run("particles" if args.particles_only else "all")
         deadline = time.monotonic() + 180
         while window.process is not None and time.monotonic() < deadline:
             app.processEvents()
@@ -54,8 +67,25 @@ def main():
             (4, "diagnostics"),
         ):
             window.views.setCurrentIndex(index)
+            if name == "particles":
+                window.angle_combo.setCurrentIndex(window.angle_combo.findData("polar"))
             app.processEvents()
             window.grab().save(str(out / f"{theme}-{name}.png"))
+            if name == "particles" and window.particles.arrival_meridional_angle_deg is not None:
+                window.angle_combo.setCurrentIndex(window.angle_combo.findData("signed_meridional"))
+                app.processEvents()
+                window.grab().save(str(out / f"{theme}-particles-signed.png"))
+                window.radial_combo.setCurrentIndex(1)
+                app.processEvents()
+                window.grab().save(str(out / f"{theme}-particles-signed-ring.png"))
+                window.radial_combo.setCurrentIndex(0)
+                current_particles = window.particles
+                window.particles = replace(current_particles, arrival_meridional_angle_deg=None)
+                window.draw_particles()
+                app.processEvents()
+                window.grab().save(str(out / f"{theme}-particles-legacy.png"))
+                window.particles = current_particles
+                window.draw_particles()
         window.settings_tabs.setCurrentIndex(1)
         window.controls["density"].setEnabled(False)
         window.controls["density_expression"].setFocus()
@@ -72,6 +102,7 @@ def main():
         window.settings_tabs.setCurrentIndex(0)
     assert not errors, errors
     window.theme_combo.setCurrentIndex(window.theme_combo.findData(original_theme))
+    window.angle_combo.setCurrentIndex(window.angle_combo.findData(original_angle))
     window.close()
     print("Screenshots:", out.resolve(), flush=True)
 

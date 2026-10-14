@@ -47,6 +47,15 @@ class ParticleInjection:
 
 
 @dataclass
+class AngularDistribution:
+    angle_edges_deg: np.ndarray
+    counts: np.ndarray
+    iaedf: np.ndarray
+    iadf: np.ndarray
+    radial_iaedf: np.ndarray
+
+
+@dataclass
 class ParticleResult:
     energy_edges_ev: np.ndarray
     angle_edges_deg: np.ndarray
@@ -64,6 +73,47 @@ class ParticleResult:
     arrival_collisions: np.ndarray
     diagnostics: dict
     arrival_particle_index: np.ndarray | None = None
+    arrival_meridional_angle_deg: np.ndarray | None = None
+
+    def angular_distribution(self, mode: str = "polar") -> AngularDistribution:
+        if mode == "polar":
+            return AngularDistribution(
+                self.angle_edges_deg, self.counts, self.iaedf, self.iadf, self.radial_iaedf
+            )
+        if mode != "signed_meridional":
+            raise ValueError("角度定義はpolarまたはsigned_meridionalを指定してください。")
+        if self.arrival_meridional_angle_deg is None:
+            raise ValueError("符号付き断面内角度がありません。粒子計算を再実行してください。")
+        # Double the bin count to retain the polar view's angular resolution.
+        edges = np.linspace(-90, 90, 2 * (len(self.angle_edges_deg) - 1) + 1)
+        counts, _ = np.histogramdd(
+            np.column_stack(
+                (self.arrival_radius_m, self.arrival_energy_ev, self.arrival_meridional_angle_deg)
+            ),
+            bins=(self.radius_edges_m, self.energy_edges_ev, edges),
+        )
+        if int(counts.sum()) != len(self.arrival_energy_ev):
+            raise ValueError("符号付き角度の分布範囲外に到達粒子があります。")
+        return normalize_angular_counts(counts, self.energy_edges_ev, edges)
+
+
+def normalize_angular_counts(counts, energy_edges, angle_edges) -> AngularDistribution:
+    de, da = np.diff(energy_edges), np.diff(angle_edges)
+    global_counts = counts.sum(axis=0)
+    joint = global_counts / global_counts.sum() / de[:, None] / da[None, :]
+    iadf = np.sum(joint * de[:, None], axis=0)
+    radial_total = counts.sum(axis=(1, 2))
+    radial_joint = (
+        np.divide(
+            counts,
+            radial_total[:, None, None],
+            out=np.zeros_like(counts),
+            where=radial_total[:, None, None] > 0,
+        )
+        / de[None, :, None]
+        / da[None, None, :]
+    )
+    return AngularDistribution(angle_edges, counts, joint, iadf, radial_joint)
 
 
 def interpolate_periodic(
@@ -219,28 +269,26 @@ def distributions(
     global_counts = counts.sum(axis=0)
     if int(global_counts.sum()) != len(energy):
         raise RuntimeError("分布の範囲外に到達粒子がありました。")
-    de, da = np.diff(energy_edges), np.diff(angle_edges)
-    joint = global_counts / len(energy) / de[:, None] / da[None, :]
-    iedf = np.sum(joint * da[None, :], axis=1)
-    iadf = np.sum(joint * de[:, None], axis=0)
+    angular = normalize_angular_counts(counts, energy_edges, angle_edges)
+    iedf = np.sum(angular.iaedf * np.diff(angle_edges)[None, :], axis=1)
     radial_total = counts.sum(axis=(1, 2))
-    radial_joint = (
-        np.divide(
-            counts,
-            radial_total[:, None, None],
-            out=np.zeros_like(counts),
-            where=radial_total[:, None, None] > 0,
-        )
-        / de[None, :, None]
-        / da[None, None, :]
-    )
     area = np.pi * np.diff(radial_edges**2)
     flux = (
         np.full(cfg.radial_bins, np.nan)
         if source_rate_s is None
         else (radial_total * source_rate_s / cfg.particles / area)
     )
-    return energy_edges, angle_edges, radial_edges, counts, joint, iedf, iadf, radial_joint, flux
+    return (
+        energy_edges,
+        angle_edges,
+        radial_edges,
+        counts,
+        angular.iaedf,
+        iedf,
+        angular.iadf,
+        angular.radial_iaedf,
+        flux,
+    )
 
 
 def run_particles(
@@ -335,6 +383,7 @@ def run_particles(
     arrival = np.zeros(cfg.particles, dtype=bool)
     hit_energy = np.zeros(cfg.particles)
     hit_angle = np.zeros(cfg.particles)
+    hit_meridional_angle = np.zeros(cfg.particles)
     hit_radius = np.zeros(cfg.particles)
     hit_phase = np.zeros(cfg.particles)
     lost_ground = 0
@@ -420,6 +469,17 @@ def run_particles(
                     )
                 )
             )
+            # Wafer tangent is +r: outward positive, toward the axis negative. The
+            # azimuthal velocity is omitted. At exactly r=0 use the +x meridian.
+            radial_velocity = np.divide(
+                np.sum(hit_v[:, :2] * next_position[wafer, :2], axis=1),
+                contact_radius[wafer],
+                out=hit_v[:, 0].copy(),
+                where=contact_radius[wafer] > 0,
+            )
+            hit_meridional_angle[hit_ids] = np.degrees(
+                np.arctan2(radial_velocity, abs(hit_v[:, 2]))
+            )
             hit_radius[hit_ids] = contact_radius[wafer]
             hit_phase[hit_ids] = np.remainder(next_time[wafer], period)
             arrival[hit_ids] = True
@@ -493,6 +553,14 @@ def run_particles(
         "collision_step_hazard": collision_step_hazard,
         "mean_energy_ev": float(hit_energy[arrival].mean()),
         "mean_angle_deg": float(hit_angle[arrival].mean()),
+        "mean_meridional_angle_deg": float(hit_meridional_angle[arrival].mean()),
+        "angle_definitions": {
+            "polar": "acos(abs(vz)/speed), 0..90 deg; includes azimuthal velocity",
+            "signed_meridional": (
+                "atan2(vr, abs(vz)), -90..90 deg; +r outward, -r inward; "
+                "azimuthal velocity omitted; +x meridian at exactly r=0"
+            ),
+        },
         "mean_collision_count": float(collision_count[arrival].mean()),
         "field_periodic_converged": field.converged,
         "warnings": warnings_list,
@@ -510,4 +578,5 @@ def run_particles(
         collision_count[arrival],
         diagnostics,
         np.flatnonzero(arrival),
+        hit_meridional_angle[arrival],
     )
