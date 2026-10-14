@@ -66,6 +66,33 @@ uv run --locked --extra cuda python -m sheath_pic.cli field --backend cuda
 CPU/CUDAの比較結果は`artifacts/cuda-benchmark/report.json`と各場NPZに保存します。
 `--nr`、`--nz`、`--cycles`、`--project`、`--output`で条件を指定できます。
 
+別環境でGPUが選ばれない場合は、まず現在の環境を変更せずに診断してください。
+
+```powershell
+uv run --no-sync python scripts/check_cuda.py
+```
+
+Pythonの実体、CUDA用依存、GPU、ドライバーAPI版と、cuDSSのFP64実計算の成否を表示します。
+CUDA用依存が未導入なら、次のコマンドで同期・起動してください。
+
+```powershell
+uv sync --locked --extra cuda
+uv run --locked --extra cuda python scripts/check_cuda.py
+uv run --locked --extra cuda python -m sheath_pic
+```
+
+`uv sync`だけでは任意のCUDA追加依存は導入されません。
+起動スクリプトの自動判定は`nvidia-smi`がコマンドとして見つかることに依存します。
+GUIの「計算」タブで「CPU」を選んだ場合もGPUは使用しません。
+「CUDA GPU」を指定すると、初期化失敗時にCPUへ切り替えずエラーを表示します。
+「自動」のCPU切替理由は開始時のログと結果の「診断」に記録します。
+
+現行のCUDA追加依存はCUDA 13系です。ドライバーとGPUの対応条件を
+[NVIDIAの互換性資料](https://docs.nvidia.com/deploy/cuda-compatibility/minor-version-compatibility.html)で確認してください。
+CuPyのライブラリ・Toolkit導入条件は[公式のインストール手順](https://docs.cupy.dev/en/stable/install.html)を参照してください。
+診断がPASSでGPU使用率が低い場合は、計算段階と「実行環境」を確認してください。
+Boltzpmp・イオンMC・行列の組み立てはCPUで動作し、GPUを使うのはRF場の疎行列計算です。
+
 最初の動作確認は「計算」タブの「粗い格子の動作確認設定」を押し、
 「未収束場で粒子計算を許可（探索用）」を選んで「すべて計算」を実行します。
 この短いデモは合成波形による探索です。実データの評価には、周期定常と計算解像度の確認が必要です。

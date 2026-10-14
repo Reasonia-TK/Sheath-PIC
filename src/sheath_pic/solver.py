@@ -405,6 +405,10 @@ def run_fields(
     with LinearBackend(project.numerics.backend) as backend:
         progress_callback = progress or (lambda *_: None)
         progress_callback(0, f"計算環境：{backend.name} / {backend.device} / FP64")
+        if backend.unavailable_reason:
+            progress_callback(
+                0, f"CUDAを利用できないためCPUで計算します：{backend.unavailable_reason}"
+            )
         result = _run_fields(
             project, table, waveform, progress, cancelled, checkpoint, restart, backend
         )

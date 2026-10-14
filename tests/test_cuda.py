@@ -27,6 +27,7 @@ def cuda_available():
 
 def test_cuda_unavailable_is_visible_and_explicit_cuda_never_silently_falls_back(monkeypatch):
     import sys
+    from types import SimpleNamespace
 
     monkeypatch.setitem(sys.modules, "cupy", None)
     with LinearBackend("auto") as backend:
@@ -34,6 +35,22 @@ def test_cuda_unavailable_is_visible_and_explicit_cuda_never_silently_falls_back
         assert backend.unavailable_reason
     with pytest.raises(RuntimeError, match="初期化"):
         LinearBackend("cuda")
+    messages = []
+
+    def calculation(*args):
+        # A fallback must be explained before the potentially long discharge solve.
+        backend = args[-1]
+        assert backend.name == "cpu"
+        assert any(backend.unavailable_reason in message for message in messages)
+        return SimpleNamespace(diagnostics={})
+
+    monkeypatch.setattr("sheath_pic.solver._run_fields", calculation)
+    project = Project()
+    project.numerics.backend = "auto"
+    result = run_fields(
+        project, None, None, progress=lambda value, message: messages.append(message)
+    )
+    assert result.diagnostics["backend"]["actual"] == "cpu"
 
 
 def test_backend_choice_does_not_change_physical_field_identity():
