@@ -823,6 +823,7 @@ def _run_fields(project, table, waveform, progress, cancelled, checkpoint, resta
         electron_energy_density_floor_m3=energy_density_floor,
         warnings=warnings_list,
         field_model="axisymmetric ion Euler / SG electron continuity + energy / coupled Poisson",
+        field_equations_version=2,
         bottom_annulus_boundary="insulating, zero normal particle and electric flux",
         source_waveform=waveform.source,
         source_waveform_sha256=waveform.source_hash,

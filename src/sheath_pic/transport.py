@@ -78,9 +78,78 @@ def cache_key(project: Project, version: str) -> str:
         "pressure": project.plasma.pressure_pa,
         "temperature": project.plasma.gas_temperature_k,
         "settings": project.to_dict()["transport"],
-        "model": "DC-gas-heating-no-superelastic-v1",
+        "model": "DC-gas-heating-elastic-collision-moment-v2",
     }
     return hashlib.sha256(json.dumps(payload, sort_keys=True).encode()).hexdigest()
+
+
+def elastic_collision_solver(bp, solver):
+    """Build the same elastic operator on the same velocity mesh, without inelastic terms.
+
+    Centre AND face samples preserve Boltzpmp's momentum-transfer and thermal-gas
+    coefficients. EFFECTIVE subtraction follows boltzpmp-core/processes.rs.
+    """
+    from dataclasses import replace
+
+    energy = np.unique(np.r_[solver.mesh.eps_b, solver.mesh.eps_c])
+    gases = []
+    for gas in solver.mixture.gases:
+        elastic_sections = []
+        for section in gas.cross_sections:
+            if section.kind not in {"ELASTIC", "EFFECTIVE"}:
+                continue
+            subtracted = np.zeros_like(energy)
+            if section.kind == "EFFECTIVE":
+                for other in gas.cross_sections:
+                    if other.target == section.target and (
+                        (other.kind == "EXCITATION" and other.threshold >= 0)
+                        or other.kind in {"IONIZATION", "ATTACHMENT"}
+                    ):
+                        subtracted += other.sigma(energy)
+            sigma = np.maximum(section.sigma(energy) - subtracted, 0)
+            momentum = section.momentum_transfer(energy)
+            if momentum is not None:
+                momentum = np.column_stack((energy, np.maximum(momentum - subtracted, 0)))
+            elastic_sections.append(
+                replace(
+                    section,
+                    kind="ELASTIC",
+                    data=np.column_stack((energy, sigma)),
+                    mt_data=momentum,
+                )
+            )
+        if elastic_sections:
+            gases.append(bp.Gas(gas.name, gas.fraction, elastic_sections, mass_amu=gas.mass_amu))
+    if not gases:
+        raise ValueError("電子の弾性衝突過程がありません。")
+    mixture = bp.Mixture(gases, N=solver.mixture.N, T_K=solver.mixture.T_K)
+    return bp.PMSolver(
+        mixture,
+        energy_grid=solver.mesh.eps_b,
+        n_theta=solver.mesh.n_theta,
+        superelastic=False,
+        gas_heating=solver.gas_heating,
+    )
+
+
+def elastic_energy_loss(result, elastic_solver) -> float:
+    """Net elastic eV m^3/s from the Boltzpmp collision moment, without power subtraction.
+
+    Elastic energy exchange with an isotropic neutral gas depends only on f0. Using
+    an isotropic state avoids cancellation of large angular-redistribution terms.
+    Negative net loss (gas heating) is clipped; the fluid's thermal floor supplies it.
+    """
+    mesh = result.mesh
+    numbers = result.n.reshape(mesh.shape).sum(axis=1)
+    state = (numbers[:, None] * mesh.w_theta[None, :]).ravel()
+    # The exposed native API returns dn/dt, as verified against the ionization moment.
+    rate = np.asarray(elastic_solver._core_solver.collision_apply(state.tolist())).reshape(
+        mesh.shape
+    )
+    loss = -np.sum(rate * mesh.eps_c[:, None]) / (state.sum() * elastic_solver.mixture.N)
+    if not np.isfinite(loss):
+        raise ArithmeticError("弾性衝突のエネルギー移送が有限値ではありません。")
+    return max(float(loss), 0.0)
 
 
 def build_transport(
@@ -112,6 +181,8 @@ def build_transport(
     results = []
     tails = []
     truncation = []
+    elastic_operators = {}
+    elastic_losses = []
     for index, en in enumerate(fields_td):
         if cancelled():
             raise InterruptedError("電子物性計算を中断しました。")
@@ -143,6 +214,9 @@ def build_transport(
         if result is None or tail > settings.tail_tolerance:
             raise RuntimeError(f"{en:g} TdのEEDF高エネルギー端が収束しませんでした。")
         results.append(result)
+        if energy_max not in elastic_operators:
+            elastic_operators[energy_max] = elastic_collision_solver(bp, solver)
+        elastic_losses.append(elastic_energy_loss(result, elastic_operators[energy_max]))
         tails.append(tail)
         truncation.append(energy_max)
         progress(
@@ -151,7 +225,7 @@ def build_transport(
         )
     excitation = np.zeros(len(results))
     ionization = np.zeros(len(results))
-    elastic = np.zeros(len(results))
+    elastic = np.asarray(elastic_losses)
     warnings_list = []
     for i, result in enumerate(results):
         for section in sections:
@@ -174,22 +248,6 @@ def build_transport(
                 if "excitation" in k.lower() and "superelastic" not in k.lower()
             )
         ionization[i] = float(result.reduced_ionization_frequency)
-        # DC steady energy balance: e E W / (e N) minus explicit inelastic threshold losses.
-        input_ev_m3_s = fields_td[i] * TOWNSEND * result.drift_velocity
-        inelastic = sum(
-            section.threshold
-            * sum(
-                v
-                for k, v in result.rate_coefficients.items()
-                if section.name in k and k.startswith("Ar:")
-            )
-            for section in sections
-            if section.kind in {"EXCITATION", "IONIZATION"}
-        )
-        growth_loss = result.mean_energy * ionization[i]
-        elastic[i] = max(input_ev_m3_s - inelastic - growth_loss, 0.0)
-        if elastic[i] > input_ev_m3_s * 0.5 and result.mean_energy > 10:
-            warnings_list.append(f"{fields_td[i]:g} Td: 弾性損失の定常収支近似を確認してください。")
     sample_energy = np.unique(
         np.concatenate(
             (
@@ -234,7 +292,10 @@ def build_transport(
             "energy_cutoffs_ev": truncation,
             "electron_diffusion_closure": "Einstein with energy-equivalent Te (Maxwell closure)",
             "energy_transport_closure": "5/3 particle transport coefficients (Maxwell closure)",
-            "elastic_loss_closure": "DC power minus thresholds and electron-growth energy",
+            "elastic_loss_closure": (
+                "Boltzpmp elastic-only collision energy moment; isotropic f0; gas heating enabled"
+            ),
+            "elastic_gas_heating_closure": "negative net loss clipped; Maxwell fluid thermal floor",
             "warnings": warnings_list,
         },
     )

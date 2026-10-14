@@ -74,7 +74,7 @@ def save_particles(path: Path, result: ParticleResult) -> None:
         {
             name: getattr(result, name)
             for name in result.__dataclass_fields__
-            if name != "diagnostics"
+            if name != "diagnostics" and getattr(result, name) is not None
         },
         {"diagnostics": result.diagnostics},
     )
@@ -128,7 +128,12 @@ def field_fingerprint(project: dict, transport_key: str, waveform_hash: str = ""
         "backend",
     ):
         n.pop(key, None)
-    payload = {"project": copy, "transport": transport_key, "waveform": waveform_hash}
+    payload = {
+        "project": copy,
+        "transport": transport_key,
+        "waveform": waveform_hash,
+        "field_equations_version": 2,
+    }
     return hashlib.sha256(json.dumps(payload, sort_keys=True).encode()).hexdigest()
 
 

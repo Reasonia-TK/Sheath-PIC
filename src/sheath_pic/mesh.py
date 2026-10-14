@@ -218,13 +218,45 @@ class AxisymmetricMesh:
         return self.linear_backend.solve(key, matrix, rhs)
 
     def electric_field(self, potential: np.ndarray, wafer_voltage: float):
+        def inward_gradient(boundary, first, second, distance, spacing):
+            # Quadratic through the metal face and two cell centres, evaluated at the
+            # first centre. A face-to-centre secant is a face field, not a centre field.
+            return (
+                -spacing / (distance * (distance + spacing)) * boundary
+                + (spacing - distance) / (distance * spacing) * first
+                + distance / ((distance + spacing) * spacing) * second
+            )
+
         er = -np.gradient(potential, self.r, axis=0, edge_order=2)
         ez = -np.gradient(potential, self.z, axis=1, edge_order=2)
-        er[0] = -(potential[1] - potential[0]) / (self.r[1] - self.r[0])
-        er[-1] = potential[-1] / (self.geometry.chamber_radius_m - self.r[-1])
-        ez[:, -1] = potential[:, -1] / (self.geometry.gap_m - self.z[-1])
-        ez[self.cathode_rows, 0] = -(potential[self.cathode_rows, 0] - wafer_voltage) / self.z[0]
-        ez[~self.cathode_rows, 0] = 0.0
+        er[0] = -2 * self.r[0] * (potential[1] - potential[0]) / (self.r[1] ** 2 - self.r[0] ** 2)
+        er[-1] = inward_gradient(
+            0,
+            potential[-1],
+            potential[-2],
+            self.geometry.chamber_radius_m - self.r[-1],
+            self.r[-1] - self.r[-2],
+        )
+        ez[:, -1] = inward_gradient(
+            0,
+            potential[:, -1],
+            potential[:, -2],
+            self.geometry.gap_m - self.z[-1],
+            self.z[-1] - self.z[-2],
+        )
+        ez[self.cathode_rows, 0] = -inward_gradient(
+            wafer_voltage,
+            potential[self.cathode_rows, 0],
+            potential[self.cathode_rows, 1],
+            self.z[0],
+            self.z[1] - self.z[0],
+        )
+        ez[~self.cathode_rows, 0] = (
+            -2
+            * self.z[0]
+            * (potential[~self.cathode_rows, 1] - potential[~self.cathode_rows, 0])
+            / (self.z[1] ** 2 - self.z[0] ** 2)
+        )
         return er, ez
 
     def initial_density(self, plasma: Plasma, csv_path=None) -> np.ndarray:
